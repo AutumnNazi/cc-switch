@@ -2327,14 +2327,24 @@ impl RequestForwarder {
             self.non_streaming_timeout
         };
 
-        // 获取全局代理 URL
-        let upstream_proxy_url: Option<String> = super::http_client::get_current_proxy_url();
+        // 获取该供应商生效的出站代理配置
+        //
+        // 按 provider 而非全局解析：国内中转站直连更快，官方 API 必须走代理。
+        // `forward` 每次尝试都由故障转移循环带着当次 provider 调用，所以转移到
+        // 下一家时这里会自动按新供应商的设置重新解析，不会沿用上一家的代理。
+        let proxy_selection = provider.proxy_selection();
+        let upstream_proxy_url: Option<String> =
+            proxy_selection.url().map(str::to_string);
 
         // SOCKS5 代理不支持 CONNECT 隧道，需要用 reqwest
         let is_socks_proxy = upstream_proxy_url
             .as_deref()
             .map(|u| u.starts_with("socks5"))
             .unwrap_or(false);
+
+        // 强制直连必须走 reqwest：hyper 路径在 proxy_url 为 None 时会复用
+        // 全局连接池，而那个池跟随系统环境变量代理，等于绕过「强制直连」。
+        let force_direct = proxy_selection.is_direct();
 
         let preserve_exact_header_case = should_preserve_exact_header_case(
             adapter.name(),
@@ -2344,13 +2354,13 @@ impl RequestForwarder {
         );
 
         // 发送请求
-        let response = if is_socks_proxy || !preserve_exact_header_case {
+        let response = if is_socks_proxy || force_direct || !preserve_exact_header_case {
             // OpenAI / Copilot / Codex 类后端不依赖原始 header 大小写；走 reqwest
             // 连接池，避免 raw TCP/TLS path 每次请求都重新握手。SOCKS5 也只能走 reqwest。
             log::debug!(
-                "[Forwarder] Using pooled reqwest client (preserve_exact_header_case={preserve_exact_header_case}, socks_proxy={is_socks_proxy})"
+                "[Forwarder] Using pooled reqwest client (preserve_exact_header_case={preserve_exact_header_case}, socks_proxy={is_socks_proxy}, force_direct={force_direct})"
             );
-            let client = super::http_client::get();
+            let client = super::http_client::get_for_selection(&proxy_selection);
             let mut request = client.request(method.clone(), &url);
             if request_is_streaming {
                 // reqwest 的 timeout 是整请求超时；流式请求交给 response_processor

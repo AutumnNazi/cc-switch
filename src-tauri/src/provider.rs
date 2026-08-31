@@ -127,6 +127,31 @@ impl Provider {
             .unwrap_or(false)
     }
 
+    /// 该供应商的出站代理模式；未显式配置时跟随全局。
+    pub fn proxy_mode(&self) -> ProxyMode {
+        self.meta
+            .as_ref()
+            .and_then(|m| m.proxy_mode)
+            .unwrap_or_default()
+    }
+
+    /// 该供应商专用的出站代理地址；留空（或全空白）视为未设置。
+    pub fn proxy_url(&self) -> Option<&str> {
+        self.meta
+            .as_ref()
+            .and_then(|m| m.proxy_url.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// 解析该供应商实际生效的出站代理配置。
+    ///
+    /// 把「模式 + 专用地址」收敛成一个值，避免各调用点各自拼装而漏掉
+    /// `Always` + 专用地址这种组合。
+    pub fn proxy_selection(&self) -> crate::proxy::http_client::ProxySelection {
+        crate::proxy::http_client::ProxySelection::resolve(self.proxy_mode(), self.proxy_url())
+    }
+
     pub fn has_usage_script_enabled(&self) -> bool {
         self.meta
             .as_ref()
@@ -376,6 +401,22 @@ pub struct AuthBinding {
     pub account_id: Option<String>,
 }
 
+/// 供应商级出站代理模式。
+///
+/// 控制该供应商的上游请求是否经过全局出站代理（设置 → 网络里配置的
+/// http/socks5 代理）。默认 `Inherit`，与全局开关保持一致。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyMode {
+    /// 跟随全局设置（默认）。
+    #[default]
+    Inherit,
+    /// 强制走全局代理；全局未配置代理时退化为直连。
+    Always,
+    /// 强制直连，忽略全局代理与系统环境变量代理。
+    Never,
+}
+
 /// Claude Desktop 3P 写入模式。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -541,6 +582,19 @@ pub struct ProviderMeta {
     /// models/gateways (and that error is non-retryable).
     #[serde(rename = "maxOutputTokens", skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
+    /// 出站代理模式：该供应商的上游请求采用何种代理策略。
+    ///
+    /// 全局出站代理（设置 → 网络）原先是一刀切：所有供应商共用。国内中转站
+    /// 直连更快、走代理反而绕路甚至被拒，而官方 API 又必须走代理，因此这里
+    /// 按供应商覆盖。`None` 等同 `Inherit`，保证旧配置行为不变。
+    #[serde(rename = "proxyMode", skip_serializing_if = "Option::is_none")]
+    pub proxy_mode: Option<ProxyMode>,
+    /// 该供应商专用的出站代理地址（仅 `proxy_mode = Always` 时生效）。
+    ///
+    /// `Always` 使用此地址强制走代理，不依赖全局代理配置，同时支持不同供应商
+    /// 使用不同的代理出口。
+    #[serde(rename = "proxyUrl", skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
     /// Custom User-Agent for local proxy routing.
     #[serde(rename = "customUserAgent", skip_serializing_if = "Option::is_none")]
     pub custom_user_agent: Option<String>,

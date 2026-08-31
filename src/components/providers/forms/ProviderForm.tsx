@@ -28,6 +28,7 @@ import type {
   CodexChatReasoning,
   PromptCacheRoutingMode,
   ClaudeApiKeyField,
+  ProxyMode,
 } from "@/types";
 import {
   providerPresets,
@@ -78,6 +79,13 @@ import { CommonConfigEditor } from "./CommonConfigEditor";
 import GeminiConfigEditor from "./GeminiConfigEditor";
 import JsonEditor from "@/components/JsonEditor";
 import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { ProviderPresetSelector } from "./ProviderPresetSelector";
 import { BasicFormFields } from "./BasicFormFields";
 import { ClaudeFormFields } from "./ClaudeFormFields";
@@ -424,6 +432,8 @@ function ProviderFormFull({
     setCodexChatReasoning(initialData?.meta?.codexChatReasoning ?? {});
     setPromptCacheRouting(initialData?.meta?.promptCacheRouting ?? "auto");
     setCustomUserAgent(initialData?.meta?.customUserAgent ?? "");
+    setProxyMode(initialData?.meta?.proxyMode ?? "inherit");
+    setProxyUrl(initialData?.meta?.proxyUrl ?? "");
     setLocalProxyHeadersOverride(
       formatRequestOverrideObject(
         initialData?.meta?.localProxyRequestOverrides?.headers,
@@ -622,6 +632,12 @@ function ProviderFormFull({
     );
   const [customUserAgent, setCustomUserAgent] = useState<string>(
     () => initialData?.meta?.customUserAgent ?? "",
+  );
+  const [proxyMode, setProxyMode] = useState<ProxyMode>(
+    () => initialData?.meta?.proxyMode ?? "inherit",
+  );
+  const [proxyUrl, setProxyUrl] = useState<string>(
+    () => initialData?.meta?.proxyUrl ?? "",
   );
   const [localProxyHeadersOverride, setLocalProxyHeadersOverride] =
     useState<string>(() =>
@@ -1775,6 +1791,12 @@ function ProviderFormFull({
         (appId === "claude" || appId === "codex") && category !== "official"
           ? customUserAgent.trim() || undefined
           : undefined,
+      // 出站代理模式对所有客户端/类别通用；"inherit" 是缺省语义，不落盘
+      proxyMode: proxyMode !== "inherit" ? proxyMode : undefined,
+      // 专用地址只属于 always；切回其他模式时不留残值，避免下次改回 always
+      // 时静默启用一个用户早已忘记的旧地址。
+      proxyUrl:
+        proxyMode === "always" && proxyUrl.trim() ? proxyUrl.trim() : undefined,
       localProxyRequestOverrides: shouldApplyLocalProxyRequestOverrides
         ? overridesResult.overrides
         : undefined,
@@ -2430,6 +2452,8 @@ function ProviderFormFull({
               onApiKeyFieldChange={handleApiKeyFieldChange}
               isFullUrl={localIsFullUrl}
               onFullUrlChange={setLocalIsFullUrl}
+              proxyMode={proxyMode}
+              proxyUrl={proxyUrl}
               customUserAgent={customUserAgent}
               onCustomUserAgentChange={setCustomUserAgent}
               localProxyHeadersOverride={localProxyHeadersOverride}
@@ -2505,6 +2529,8 @@ function ProviderFormFull({
               catalogModels={codexCatalogModels}
               onCatalogModelsChange={setCodexCatalogModels}
               speedTestEndpoints={speedTestEndpoints}
+              proxyMode={proxyMode}
+              proxyUrl={proxyUrl}
               customUserAgent={customUserAgent}
               onCustomUserAgentChange={setCustomUserAgent}
               localProxyHeadersOverride={localProxyHeadersOverride}
@@ -2787,6 +2813,47 @@ function ProviderFormFull({
                 onPricingConfigChange={setPricingConfig}
               />
             )}
+
+          {/* 出站代理模式：所有客户端通用 */}
+          <div className="space-y-2">
+            <Label>{t("providerForm.proxyModeLabel")}</Label>
+            <Select
+              value={proxyMode}
+              onValueChange={(value) => setProxyMode(value as ProxyMode)}
+            >
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="inherit">
+                  {t("providerForm.proxyModeInherit")}
+                </SelectItem>
+                <SelectItem value="always">
+                  {t("providerForm.proxyModeAlways")}
+                </SelectItem>
+                <SelectItem value="never">
+                  {t("providerForm.proxyModeNever")}
+                </SelectItem>
+              </SelectContent>
+            </Select>
+            {proxyMode === "always" && (
+              <div className="space-y-1.5 pt-1">
+                <ImeSafeInput
+                  value={proxyUrl}
+                  onValueChange={setProxyUrl}
+                  placeholder={t("providerForm.proxyUrlPlaceholder")}
+                  spellCheck={false}
+                  autoComplete="off"
+                />
+                <p className="text-xs leading-relaxed text-muted-foreground">
+                  {t("providerForm.proxyUrlHint")}
+                </p>
+              </div>
+            )}
+            <p className="text-xs leading-relaxed text-muted-foreground">
+              {t("providerForm.proxyModeHint")}
+            </p>
+          </div>
 
           {showButtons && (
             <div className="flex justify-end gap-2">

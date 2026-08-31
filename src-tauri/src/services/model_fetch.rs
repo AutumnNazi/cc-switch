@@ -64,6 +64,7 @@ const KNOWN_COMPAT_SUFFIXES: &[&str] = &[
 /// 获取供应商的可用模型列表
 ///
 /// 使用 OpenAI 兼容的 GET /v1/models 端点，按候选列表顺序尝试。
+#[allow(clippy::too_many_arguments)]
 pub async fn fetch_models(
     base_url: &str,
     api_key: &str,
@@ -72,11 +73,14 @@ pub async fn fetch_models(
     user_agent: Option<HeaderValue>,
     api_format: Option<&str>,
     request_headers: Option<&BTreeMap<String, String>>,
+    proxy_selection: &crate::proxy::http_client::ProxySelection,
 ) -> Result<Vec<FetchedModel>, String> {
     let candidates = build_models_url_candidates(base_url, is_full_url, models_url_override)?;
     let headers =
         build_model_fetch_headers(api_key, api_format, user_agent.as_ref(), request_headers)?;
-    let client = crate::proxy::http_client::get();
+    // 模型列表打的是用户配置的 base_url（可能是中转站），必须跟随该供应商的代理设置，
+    // 否则「强制走代理」的境外站会在这里直连失败。
+    let client = crate::proxy::http_client::get_for_selection(proxy_selection);
     let mut last_err: Option<String> = None;
     let mut known_secrets = vec![api_key.to_string()];
     if let Some(request_headers) = request_headers {
