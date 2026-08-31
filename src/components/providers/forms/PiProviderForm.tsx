@@ -962,6 +962,8 @@ export function PiProviderForm({
       {
         apiFormat: api,
         requestHeaders,
+        proxyMode: initialData?.meta?.proxyMode,
+        proxyUrl: initialData?.meta?.proxyUrl,
       },
     )
       .then((result) => {

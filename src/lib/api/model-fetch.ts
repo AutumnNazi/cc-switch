@@ -10,6 +10,10 @@ export interface FetchedModel {
 export interface ModelFetchOptions {
   apiFormat?: string;
   requestHeaders?: Record<string, string>;
+  /** 供应商出站代理模式；省略等同 "inherit"（跟随全局代理） */
+  proxyMode?: import("@/types").ProxyMode;
+  /** 供应商专用代理地址；仅 proxyMode="always" 时生效，留空回落全局 */
+  proxyUrl?: string;
 }
 
 /**
@@ -41,6 +45,8 @@ export async function fetchModelsForConfig(
     customUserAgent,
     apiFormat: options?.apiFormat,
     requestHeaders: options?.requestHeaders,
+    proxyMode: options?.proxyMode,
+    proxyUrl: options?.proxyUrl,
   });
 }
 

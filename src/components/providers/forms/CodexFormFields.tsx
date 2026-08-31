@@ -60,6 +60,7 @@ import type {
   CodexChatReasoning,
   PromptCacheRoutingMode,
   ProviderCategory,
+  ProxyMode,
 } from "@/types";
 import type { ManagedAuthProvider } from "@/lib/api";
 import type { AppId } from "@/lib/api";
@@ -138,6 +139,10 @@ interface CodexFormFieldsProps {
 
   // Speed Test Endpoints
   speedTestEndpoints: EndpointCandidate[];
+
+  // 出站代理配置：取模型列表要与转发走同一条网络路径
+  proxyMode?: ProxyMode;
+  proxyUrl?: string;
 
   // Local proxy User-Agent override
   customUserAgent: string;
@@ -418,6 +423,8 @@ export function CodexFormFields({
   catalogModels = [],
   onCatalogModelsChange,
   speedTestEndpoints,
+  proxyMode,
+  proxyUrl,
   customUserAgent,
   onCustomUserAgentChange,
   localProxyHeadersOverride,
@@ -599,6 +606,7 @@ export function CodexFormFields({
       isFullUrl,
       undefined,
       customUserAgent,
+      { proxyMode, proxyUrl },
     )
       .then((models) => {
         if (seq !== fetchModelsSeqRef.current) return;
@@ -622,6 +630,8 @@ export function CodexFormFields({
     codexApiKey,
     isFullUrl,
     customUserAgent,
+    proxyMode,
+    proxyUrl,
     isXaiOauthPreset,
     isXaiOauthAuthenticated,
     selectedXaiAccountId,

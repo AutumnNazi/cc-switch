@@ -2,9 +2,15 @@
 //!
 //! 提供支持全局代理配置的 HTTP 客户端。
 //! 所有需要发送 HTTP 请求的模块都应使用此模块提供的客户端。
+//!
+//! 出站代理支持按供应商覆盖（见 [`ProxyMode`]）：全局代理是默认值，单个
+//! 供应商可强制走代理或强制直连。非 `Inherit` 的供应商各自复用一个按代理
+//! 配置缓存的客户端，避免每次请求重建连接池。
 
+use crate::provider::ProxyMode;
 use once_cell::sync::OnceCell;
 use reqwest::Client;
+use std::collections::HashMap;
 use std::env;
 use std::net::IpAddr;
 use std::sync::RwLock;
@@ -12,6 +18,12 @@ use std::time::Duration;
 
 /// 全局 HTTP 客户端实例
 static GLOBAL_CLIENT: OnceCell<RwLock<Client>> = OnceCell::new();
+
+/// 按代理配置缓存的客户端池（供应商级覆盖使用）
+///
+/// key 为代理 URL；`None` 代表强制直连（显式 `no_proxy`）。跟随全局的供应商
+/// 不进这个池，直接用 [`get`]。
+static SCOPED_CLIENTS: OnceCell<RwLock<HashMap<Option<String>, Client>>> = OnceCell::new();
 
 /// 当前代理 URL（用于日志和状态查询）
 static CURRENT_PROXY_URL: OnceCell<RwLock<Option<String>>> = OnceCell::new();
@@ -128,6 +140,9 @@ pub fn apply_proxy(proxy_url: Option<&str>) -> Result<(), String> {
         *url = effective_url.map(|s| s.to_string());
     }
 
+    // 全局代理变了，按供应商缓存的客户端（Always 模式指向旧地址）必须失效
+    clear_scoped_clients();
+
     log::info!(
         "[GlobalProxy] Applied: {}",
         effective_url
@@ -172,6 +187,9 @@ pub fn update_proxy(proxy_url: Option<&str>) -> Result<(), String> {
         *url = effective_url.map(|s| s.to_string());
     }
 
+    // 同 apply_proxy：全局代理变更后按供应商缓存的客户端必须失效
+    clear_scoped_clients();
+
     log::info!(
         "[GlobalProxy] Updated: {}",
         effective_url
@@ -212,8 +230,136 @@ pub fn is_proxy_enabled() -> bool {
     get_current_proxy_url().is_some()
 }
 
-/// 构建 HTTP 客户端
+/// 某个供应商实际生效的出站代理配置
+///
+/// 把「代理模式 + 供应商专用地址」收敛成一个值：调用点只需照它执行，
+/// 不必各自重复「Always 但地址从哪来」的判断。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxySelection {
+    /// 跟随全局设置。全局未配置代理时，由 reqwest 自行跟随系统代理。
+    Inherit,
+    /// 走指定代理地址（供应商专用地址优先，其次全局地址）。
+    Proxy(String),
+    /// 强制直连，并显式忽略系统环境变量代理。
+    Direct,
+}
+
+impl ProxySelection {
+    /// 解析生效配置
+    ///
+    /// `Always` 优先用供应商自己的 `proxy_url`；没填才回落全局地址。两者都为空
+    /// 时只能直连——但这是配置缺失，要告警，因为用户的意图明确是走代理。
+    pub fn resolve(mode: ProxyMode, provider_proxy_url: Option<&str>) -> Self {
+        match mode {
+            ProxyMode::Inherit => Self::Inherit,
+            ProxyMode::Never => Self::Direct,
+            ProxyMode::Always => {
+                let own = provider_proxy_url
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                match own.or_else(get_current_proxy_url) {
+                    Some(url) => Self::Proxy(url),
+                    None => {
+                        log::warn!(
+                            "[GlobalProxy] [GP-012] Provider forces proxy but neither a provider proxy URL nor a global proxy is configured; falling back to direct connection"
+                        );
+                        Self::Direct
+                    }
+                }
+            }
+        }
+    }
+
+    /// 生效的代理地址；`None` 表示不经显式代理（`Inherit` 或 `Direct`）。
+    ///
+    /// 注意 `Inherit` 与 `Direct` 都返回 `None`，但语义不同：前者仍可能由
+    /// reqwest 跟随系统代理，后者显式断绝。需要区分时用 [`Self::is_direct`]。
+    pub fn url(&self) -> Option<&str> {
+        match self {
+            Self::Proxy(url) => Some(url.as_str()),
+            Self::Inherit | Self::Direct => None,
+        }
+    }
+
+    /// 是否为强制直连
+    pub fn is_direct(&self) -> bool {
+        matches!(self, Self::Direct)
+    }
+
+    /// 客户端池的缓存键；`Inherit` 不进池，返回 `None`。
+    fn cache_key(&self) -> Option<Option<String>> {
+        match self {
+            Self::Inherit => None,
+            Self::Proxy(url) => Some(Some(url.clone())),
+            Self::Direct => Some(None),
+        }
+    }
+}
+
+/// 按供应商生效的代理配置获取 HTTP 客户端
+///
+/// `Inherit` 直接复用全局客户端；其余从按代理地址缓存的池里取，未命中则
+/// 构建后存入，避免每个请求重建连接池。
+pub fn get_for_selection(selection: &ProxySelection) -> Client {
+    let Some(key) = selection.cache_key() else {
+        return get();
+    };
+    let pool = SCOPED_CLIENTS.get_or_init(|| RwLock::new(HashMap::new()));
+
+    if let Ok(map) = pool.read() {
+        if let Some(client) = map.get(&key) {
+            return client.clone();
+        }
+    }
+
+    let built = match key.as_deref() {
+        Some(url) => build_client(Some(url)),
+        // 强制直连：必须显式 no_proxy，否则 reqwest 会回落系统环境变量代理
+        None => build_direct_client(),
+    };
+
+    let client = match built {
+        Ok(client) => client,
+        Err(e) => {
+            log::warn!("[GlobalProxy] [GP-013] Failed to build scoped client ({e}), using global");
+            return get();
+        }
+    };
+
+    if let Ok(mut map) = pool.write() {
+        map.insert(key, client.clone());
+    }
+    client
+}
+
+/// 清空按供应商缓存的客户端池
+///
+/// 全局代理变更后必须调用：池里 `Always` 的条目是按旧全局地址建的，
+/// 不清掉会让改过代理的供应商继续用老地址。
+fn clear_scoped_clients() {
+    if let Some(pool) = SCOPED_CLIENTS.get() {
+        if let Ok(mut map) = pool.write() {
+            map.clear();
+        }
+    }
+}
+
+/// 构建 HTTP 客户端（无代理地址时跟随系统代理）
 fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
+    build_client_inner(proxy_url, false)
+}
+
+/// 构建强制直连的 HTTP 客户端
+///
+/// 与 `build_client(None)` 不同：这里显式 `no_proxy()`，连系统环境变量里的
+/// HTTP_PROXY/ALL_PROXY 也一并忽略。供应商设了「强制直连」却仍走系统代理的话，
+/// 这个开关就等于没生效，所以必须显式断绝而不是"不配置代理"。
+fn build_direct_client() -> Result<Client, String> {
+    build_client_inner(None, true)
+}
+
+fn build_client_inner(proxy_url: Option<&str>, force_direct: bool) -> Result<Client, String> {
     let mut builder = Client::builder()
         .timeout(Duration::from_secs(600))
         .connect_timeout(Duration::from_secs(30))
@@ -245,6 +391,9 @@ fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
             .map_err(|e| format!("Invalid proxy URL '{}': {}", mask_url(url), e))?;
         builder = builder.proxy(proxy);
         log::debug!("[GlobalProxy] Proxy configured: {}", mask_url(url));
+    } else if force_direct {
+        builder = builder.no_proxy();
+        log::debug!("[GlobalProxy] Forced direct connection (system proxy ignored)");
     } else {
         // 未设置全局代理时，让 reqwest 自动检测系统代理（环境变量）
         // 若系统代理指向本机，禁用系统代理避免自环
@@ -405,6 +554,162 @@ mod tests {
         // 使用明确无效的 scheme 来触发错误
         let result = build_client(Some("invalid-scheme://127.0.0.1:7890"));
         assert!(result.is_err(), "Should reject invalid proxy scheme");
+    }
+
+    #[test]
+    fn test_build_direct_client_ok() {
+        assert!(build_direct_client().is_ok());
+    }
+
+    /// `Never` 必须无条件强制直连，即使环境变量里配了系统代理。
+    ///
+    /// 这是本功能最容易错的点：只要解析或客户端构建有一处回退到"读系统代理"，
+    /// 用户设的「强制直连」就静默失效了。
+    #[test]
+    fn test_never_ignores_system_proxy_env() {
+        let _guard = env_lock().lock().unwrap();
+        let saved = env::var("HTTP_PROXY").ok();
+        env::set_var("HTTP_PROXY", "http://198.51.100.7:8080");
+
+        let sel = ProxySelection::resolve(ProxyMode::Never, None);
+        assert_eq!(sel, ProxySelection::Direct);
+        assert_eq!(sel.url(), None);
+        assert!(sel.is_direct());
+
+        match saved {
+            Some(v) => env::set_var("HTTP_PROXY", v),
+            None => env::remove_var("HTTP_PROXY"),
+        }
+    }
+
+    /// `Never` 下即便填了供应商专用地址也必须直连：模式优先于地址。
+    #[test]
+    fn test_never_ignores_provider_proxy_url() {
+        let sel = ProxySelection::resolve(ProxyMode::Never, Some("http://198.51.100.20:8080"));
+        assert_eq!(sel, ProxySelection::Direct);
+    }
+
+    /// 强制直连的客户端不得继承环境变量代理。
+    #[test]
+    fn test_direct_client_built_under_system_proxy() {
+        let _guard = env_lock().lock().unwrap();
+        let saved = env::var("ALL_PROXY").ok();
+        env::set_var("ALL_PROXY", "socks5://198.51.100.9:1080");
+
+        assert!(build_direct_client().is_ok());
+
+        match saved {
+            Some(v) => env::set_var("ALL_PROXY", v),
+            None => env::remove_var("ALL_PROXY"),
+        }
+    }
+
+    /// `Inherit` 恒为 Inherit，不在解析期读取全局地址（交给全局客户端处理）。
+    #[test]
+    fn test_inherit_is_independent_of_provider_url() {
+        assert_eq!(
+            ProxySelection::resolve(ProxyMode::Inherit, None),
+            ProxySelection::Inherit
+        );
+        // Inherit 下专用地址不生效——它只属于 Always
+        assert_eq!(
+            ProxySelection::resolve(ProxyMode::Inherit, Some("http://198.51.100.30:8080")),
+            ProxySelection::Inherit
+        );
+    }
+
+    /// 核心修复：全局代理为空时，`Always` + 供应商专用地址仍必须走该地址。
+    ///
+    /// 修复前 `Always` 只读全局地址，全局为空就退化成直连，开关等于无效。
+    #[test]
+    fn test_always_uses_provider_url_without_global_proxy() {
+        let sel = ProxySelection::resolve(ProxyMode::Always, Some("http://198.51.100.11:7890"));
+        assert_eq!(
+            sel,
+            ProxySelection::Proxy("http://198.51.100.11:7890".to_string())
+        );
+        assert_eq!(sel.url(), Some("http://198.51.100.11:7890"));
+        assert!(!sel.is_direct());
+    }
+
+    /// 供应商专用地址优先于全局地址，从而支持不同供应商走不同出口。
+    #[test]
+    fn test_provider_url_takes_precedence_over_global() {
+        let _guard = env_lock().lock().unwrap();
+        let saved = CURRENT_PROXY_URL
+            .get()
+            .and_then(|l| l.read().ok())
+            .and_then(|u| u.clone());
+        let _ = CURRENT_PROXY_URL.set(RwLock::new(Some("http://10.0.0.1:1080".to_string())));
+        if let Some(lock) = CURRENT_PROXY_URL.get() {
+            if let Ok(mut w) = lock.write() {
+                *w = Some("http://10.0.0.1:1080".to_string());
+            }
+        }
+
+        let sel = ProxySelection::resolve(ProxyMode::Always, Some("http://10.0.0.2:7890"));
+        assert_eq!(sel.url(), Some("http://10.0.0.2:7890"));
+
+        // 未填专用地址时回落全局
+        let fallback = ProxySelection::resolve(ProxyMode::Always, None);
+        assert_eq!(fallback.url(), Some("http://10.0.0.1:1080"));
+
+        if let Some(lock) = CURRENT_PROXY_URL.get() {
+            if let Ok(mut w) = lock.write() {
+                *w = saved;
+            }
+        }
+    }
+
+    /// 空白专用地址视为未填，避免用户输入空格后静默变成"走空代理"。
+    #[test]
+    fn test_blank_provider_url_is_ignored() {
+        let sel = ProxySelection::resolve(ProxyMode::Always, Some("   "));
+        // 全局在测试环境下通常未配置，因此退化为 Direct；关键是不会得到空地址
+        assert_ne!(sel.url(), Some("   "));
+        assert!(sel.url().is_none_or(|u| !u.trim().is_empty()));
+    }
+
+    /// 缓存键必须区分「跟随全局」「走某代理」「强制直连」三者。
+    #[test]
+    fn test_cache_key_separates_selections() {
+        assert!(ProxySelection::Inherit.cache_key().is_none());
+        assert_eq!(ProxySelection::Direct.cache_key(), Some(None));
+        assert_eq!(
+            ProxySelection::Proxy("http://a:1".into()).cache_key(),
+            Some(Some("http://a:1".to_string()))
+        );
+        // 不同地址不得共用同一个客户端
+        assert_ne!(
+            ProxySelection::Proxy("http://a:1".into()).cache_key(),
+            ProxySelection::Proxy("http://b:2".into()).cache_key()
+        );
+    }
+
+    /// 缺省即 Inherit：老配置没有 proxyMode 字段时不能改变现有行为。
+    #[test]
+    fn test_proxy_mode_default_is_inherit() {
+        assert_eq!(ProxyMode::default(), ProxyMode::Inherit);
+    }
+
+    /// 反序列化：字段缺失落到 None，读取时等价 Inherit；显式值按 lowercase 解析。
+    #[test]
+    fn test_proxy_mode_serde_roundtrip() {
+        let missing: Option<ProxyMode> = serde_json::from_str("null").unwrap();
+        assert_eq!(missing.unwrap_or_default(), ProxyMode::Inherit);
+
+        assert_eq!(
+            serde_json::from_str::<ProxyMode>("\"never\"").unwrap(),
+            ProxyMode::Never
+        );
+        assert_eq!(
+            serde_json::from_str::<ProxyMode>("\"always\"").unwrap(),
+            ProxyMode::Always
+        );
+        assert_eq!(
+            serde_json::to_string(&ProxyMode::Never).unwrap(),
+            "\"never\""
+        );
     }
 
     #[test]

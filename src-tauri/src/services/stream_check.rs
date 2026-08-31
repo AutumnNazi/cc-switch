@@ -143,7 +143,9 @@ impl StreamCheckService {
             None => Self::resolve_base_url(app_type, provider)?,
         };
 
-        let client = crate::proxy::http_client::get();
+        // 按供应商生效的代理配置取客户端：测速必须与真实转发走同一条网络路径，
+        // 否则「强制直连」的供应商在测速时经代理，测出来的可用性是另一回事。
+        let client = crate::proxy::http_client::get_for_selection(&provider.proxy_selection());
         let timeout = std::time::Duration::from_secs(config.timeout_secs);
         let ua = Self::custom_user_agent(provider);
 

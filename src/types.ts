@@ -166,6 +166,9 @@ export interface CodexChatReasoning {
 
 export type PromptCacheRoutingMode = "auto" | "enabled" | "disabled";
 
+/** 供应商级出站代理模式（缺省视为 "inherit"）。 */
+export type ProxyMode = "inherit" | "always" | "never";
+
 export interface LocalProxyRequestOverrides {
   headers?: Record<string, string>;
   body?: Record<string, unknown>;
@@ -226,6 +229,14 @@ export interface ProviderMeta {
   // long/thinking-heavy responses. When set (>0) it takes precedence over the
   // request value and the default.
   maxOutputTokens?: number;
+  // 出站代理模式：该供应商的上游请求是否经过出站代理（设置 → 网络）。
+  // - "inherit"（缺省）：跟随全局设置
+  // - "always"：强制走代理，地址取 proxyUrl，未填则回落全局代理
+  // - "never"：强制直连，忽略全局代理与系统环境变量代理
+  proxyMode?: ProxyMode;
+  // 该供应商专用的出站代理地址，仅 proxyMode="always" 时生效。
+  // 留空则回落全局代理；支持 http/https/socks5/socks5h。
+  proxyUrl?: string;
   // Custom User-Agent for local proxy routing. Only applied by the local proxy.
   customUserAgent?: string;
   // Local proxy request overrides. Only applied by the local proxy after route transforms.

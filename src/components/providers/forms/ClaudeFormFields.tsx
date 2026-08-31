@@ -52,6 +52,7 @@ import type {
   ProviderCategory,
   ClaudeApiFormat,
   ClaudeApiKeyField,
+  ProxyMode,
 } from "@/types";
 import type { ManagedAuthProvider } from "@/lib/api";
 import {
@@ -159,6 +160,11 @@ interface ClaudeFormFieldsProps {
   onLocalProxyHeadersOverrideChange: (value: string) => void;
   localProxyBodyOverride: string;
   onLocalProxyBodyOverrideChange: (value: string) => void;
+
+  // 出站代理配置：取模型列表要与转发走同一条网络路径，否则强制直连/强制走代理的
+  // 供应商在这里会因为用错代理而拉不到模型。
+  proxyMode?: ProxyMode;
+  proxyUrl?: string;
 }
 
 export function ClaudeFormFields({
@@ -225,6 +231,8 @@ export function ClaudeFormFields({
   onLocalProxyHeadersOverrideChange,
   localProxyBodyOverride,
   onLocalProxyBodyOverrideChange,
+  proxyMode,
+  proxyUrl,
 }: ClaudeFormFieldsProps) {
   const { t } = useTranslation();
   const hasRequestOverrides = Boolean(
@@ -302,7 +310,17 @@ export function ClaudeFormFields({
     const modelsUrl = matchedPreset?.modelsUrl;
 
     setIsFetchingModels(true);
-    fetchModelsForConfig(baseUrl, apiKey, isFullUrl, modelsUrl, customUserAgent)
+    fetchModelsForConfig(
+      baseUrl,
+      apiKey,
+      isFullUrl,
+      modelsUrl,
+      customUserAgent,
+      {
+        proxyMode,
+        proxyUrl,
+      },
+    )
       .then((models) => {
         setFetchedModels(models);
         showModelFetchResult(models.length);
@@ -312,7 +330,16 @@ export function ClaudeFormFields({
         showFetchModelsError(err, t);
       })
       .finally(() => setIsFetchingModels(false));
-  }, [baseUrl, apiKey, isFullUrl, customUserAgent, showModelFetchResult, t]);
+  }, [
+    baseUrl,
+    apiKey,
+    isFullUrl,
+    customUserAgent,
+    proxyMode,
+    proxyUrl,
+    showModelFetchResult,
+    t,
+  ]);
 
   const handleFetchCopilotModels = useCallback(() => {
     if (!isCopilotAuthenticated) {
